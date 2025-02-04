@@ -1,135 +1,256 @@
 import yfinance as yf
 import pandas as pd
 import datetime
-import os
 import time
-import numpy as np
-import re
+import itertools
 
-def save_sp500_tickers(filename="sp500_tickers.csv"):
-    sp500_tickers = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-    tickers = sp500_tickers['Symbol'].tolist()
-    pd.DataFrame(tickers, columns=["Ticker"]).to_csv(filename, index=False)
-    print(f"Saved S&P 500 tickers to {filename}")
+FAANG_TICKERS = ["META", "AAPL", "AMZN", "NFLX", "GOOGL"]
 
-def load_sp500_tickers(filename="sp500_tickers.csv"):
-    if os.path.exists(filename):
-        return pd.read_csv(filename)['Ticker'].tolist()
+def fetch_faang_midday_prices(output_file, year):
+    if year==2023:
+        start_date = "2023-03-01"
+        end_date = "2023-12-31"
     else:
-        print(f"{filename} not found. Fetching tickers from Wikipedia...")
-        save_sp500_tickers(filename)
-        return load_sp500_tickers(filename)
+        start_date = "2024-03-01"
+        end_date = "2024-12-31"
 
-def fetch_midday_prices_2_years(filename="sp500_tickers.csv", years=2):
-    tickers = load_sp500_tickers(filename)
-    start_date = (datetime.datetime.now() - datetime.timedelta(weeks=years * 52)).strftime('%Y-%m-%d')
-    end_date = datetime.datetime.now().strftime('%Y-%m-%d')
     midday_prices = []
     
-    for ticker in tickers:
+    for ticker in FAANG_TICKERS:
         try:
-            print(f"Fetching data for {ticker} from {start_date} to {end_date}...")
+            #print(f"Fetching data for {ticker}...")
             data = yf.download(ticker, interval="60m", start=start_date, end=end_date)
             data.index = pd.to_datetime(data.index)
+            
             if data.empty:
                 print(f"No data for {ticker}, skipping...")
                 continue
+            
             tuesday_midday = data[(data.index.dayofweek == 1) & (data.index.hour == 12)]
             if tuesday_midday.empty:
                 print(f"No midday prices for {ticker} on Tuesdays, skipping...")
                 continue
+            
             for _, row in tuesday_midday.iterrows():
                 midday_prices.append({
-                    "Ticker": ticker,
+                    "Stock Ticker": ticker,
                     "Date": row.name.date(),
-                    "Midday Price": row['Close']
+                    "Price": row['Close']
                 })
-            time.sleep(0.5)
+            
+            time.sleep(0.5)  # Avoid rate limits
         except Exception as e:
             print(f"Error fetching data for {ticker}: {e}")
     
     midday_df = pd.DataFrame(midday_prices)
-    midday_df.to_csv("midday_prices_2_years.csv", index=False)
-    print(f"Saved midday prices to 'midday_prices_2_years.csv'")
+    midday_df.to_csv(output_file, index=False)
+    #print(f"Saved FAANG midday prices to '{output_file}'")
 
+def calculate_weekly_percent_change(input_filename, output_filename):
+    df = pd.read_csv(input_filename)  
 
-def clean_midday_price(midday_price_str):
-    match = re.search(r'(\d+\.\d+)', str(midday_price_str))
-    if match:
-        return float(match.group(1))
-    else:
-        return np.nan
+    if df.shape[1] < 3:
+        print("Error: The file must have at least three columns (Stock Ticker, Date, Price).")
+        return
 
+    df['Date'] = pd.to_datetime(df['Date'])  # Ensure Date column is in datetime format
+    df = df.sort_values(by=['Stock Ticker', 'Date'])  # Sort by stock and date
 
-def calculate_covariances(df):
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-    df = df.dropna(subset=['Date', 'Midday Price', 'Ticker'])
-    df['Midday Price'] = df['Midday Price'].apply(clean_midday_price)
-    df = df.dropna(subset=['Midday Price'])
-    df_cleaned = df.groupby(['Date', 'Ticker'], as_index=False)['Midday Price'].mean()
-    df_pivot = df_cleaned.pivot_table(index='Date', columns='Ticker', values='Midday Price')
-    df_returns = df_pivot.pct_change().dropna()
-    cov_matrix = df_returns.cov()
-    cov_pairs = []
-    seen_pairs = set()
+    df['Change'] = 0.0  # Initialize percent change column
+
+    prev_prices = {}  # Dictionary to store last week's price for each stock
+
+    for i in range(len(df)):
+        ticker = df.at[i, 'Stock Ticker']
+        price = df.at[i, 'Price']
+        
+        if ticker in prev_prices:
+            prev_price = prev_prices[ticker]
+            df.at[i, 'Change'] = ((price - prev_price) / prev_price) if prev_price != 0 else 0
+        else:
+            df.at[i, 'Change'] = 0  # First week's change is 0
+
+        prev_prices[ticker] = price  # Update previous week's price
+
+    df.to_csv(output_filename, index=False)  
+    #print(f"Saved percent change data to '{output_filename}'")
+
+def compute_normalized_dot_products(input_filename, output_filename):
+    df = pd.read_csv(input_filename)  
+
+    if df.shape[1] < 4:
+        print("Error: The file must have at least four columns (Stock Ticker, Date, Price, Percent Change).")
+        return
+
+    df = df.pivot(index="Date", columns="Stock Ticker", values="Change")  # Pivot for easy vectorized dot product
+    df = df.dropna()  # Drop rows with missing values (weeks where a stock is missing)
+
+    FAANG_TICKERS = df.columns.tolist()
+    dot_products = {}
+
+    for ticker1, ticker2 in itertools.combinations(FAANG_TICKERS, 2):  # Get all unique pairs
+        dot_product = (df[ticker1] * df[ticker2]).sum()  # Compute normalized dot product
+        dot_products[(ticker1, ticker2)] = dot_product
+
+    # Convert results to a DataFrame and save
+    result_df = pd.DataFrame(dot_products.items(), columns=["Ticker Pair", "Dot Product"])
+    result_df = result_df.sort_values(by="Dot Product", ascending=False)
+
     
-    for col in cov_matrix.columns:
-        for row in cov_matrix.index:
-            if col != row:
-                pair = tuple(sorted([col, row]))
-                if pair not in seen_pairs:
-                    seen_pairs.add(pair)
-                    cov_pairs.append((col, row, cov_matrix.loc[row, col]))
+    result_df.to_csv(output_filename, index=False)
+
+    #print(f"Saved dot products to '{output_filename}'")
+
+
+def backtest_top_pairs(input_filename, dot_products_filename, start_date, end_date, initial_budget=10000):
+    # Load percent change data and dot products
+    df = pd.read_csv(input_filename)
+    dot_products_df = pd.read_csv(dot_products_filename)
     
-    cov_df = pd.DataFrame(cov_pairs, columns=['Stock 1', 'Stock 2', 'Covariance'])
-    avg_cov = cov_df.groupby(['Stock 1', 'Stock 2']).mean().reset_index()
-    avg_cov_sorted = avg_cov.sort_values(by='Covariance', ascending=False)
-    return avg_cov_sorted
-
-
-def fetch_week_data(stock, start_date, end_date):
-    print(f"Fetching data for {stock} from {start_date} to {end_date}...")
-    data = yf.download(stock, start=start_date, end=end_date)
-    if data.empty:
-        raise ValueError(f"No data found for {stock} from {start_date} to {end_date}.")
-    return data
-
-
-def execute_trade(top_stock, start_date, end_date, investment=100):
-    try:
-        week_data = fetch_week_data(top_stock, start_date, end_date)
-        open_price = float(week_data['Open'].iloc[0])
-        close_price = float(week_data['Close'].iloc[-1])
-        shares = investment / open_price
-        final_value = shares * close_price
-        profit_loss = final_value - investment
-        return {
-            'Stock': top_stock,
-            'Open Price': open_price,
-            'Close Price': close_price,
-            'Final Value': final_value,
-            'Profit/Loss': profit_loss
-        }
-    except Exception as e:
-        print(f"Error during trade execution: {e}")
-        return None
-
-if __name__ == '__main__':
-    df = pd.read_csv('midday_prices_2_years.csv')
-    avg_cov_sorted = calculate_covariances(df)
-    avg_cov_sorted.to_csv("sorted_covariance_pairs.csv", index=False)
-    print("Saved sorted covariance pairs to 'sorted_covariance_pairs.csv'")
+    # Sort by normalized dot product (highest first)
+    top_pairs = dot_products_df.sort_values(by="Dot Product", ascending=False).head(2)
     
-    top_pair = avg_cov_sorted.iloc[0]
-    top_stock = top_pair['Stock 1']
+    # Extract top pairs
+    ticker1, ticker2 = top_pairs.iloc[0]["Ticker Pair"][1:-1].split(", ")[0][1:-1], top_pairs.iloc[0]["Ticker Pair"][1:-1].split(", ")[1][1:-1]  # Properly split the tickers without quotes
+    print(f"Top 2 most correlated pairs for backtesting: {ticker1} and {ticker2}")
     
-    results = []
-    for i in range(30):
-        start_date = (datetime.datetime(2024, 1, 1) + datetime.timedelta(weeks=i)).strftime('%Y-%m-%d')
-        end_date = (datetime.datetime(2024, 1, 7) + datetime.timedelta(weeks=i)).strftime('%Y-%m-%d')
-        result = execute_trade(top_stock, start_date, end_date, investment=100)
-        if result:
-            results.append(result)
+    # Initialize portfolio: equal amount of money invested in both stocks
+    portfolio = {ticker1: initial_budget / 2, ticker2: initial_budget / 2}
+    cash = 0
+    total_value = initial_budget
+    prices = {ticker1: [], ticker2: []}
+
+    # Read the percent change data and filter by the date range
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = df[(df['Date'] >= start_date) & (df['Date'] <= end_date)]
     
-    pd.DataFrame(results).to_csv('30_weeks_trade_results.csv', index=False)
-    print("Saved 30 weeks trade results to '30_weeks_trade_results.csv'")
+    # Debugging: Check the column names and initial data
+    print(f"Columns in DataFrame: {df.columns}")
+    print(f"Data from {start_date} to {end_date}: {df.head()}")
+
+    # Track initial value
+    start_value = total_value
+    print(f"Starting portfolio value: ${start_value}")
+    
+    # Pivot the dataframe to get percent changes for each stock as columns
+    df = df.pivot(index="Date", columns="Stock Ticker", values="Change")  # Pivot for easy vectorized dot product
+    df = df.dropna()  # Drop rows with missing values (weeks where a stock is missing)
+
+    # Loop through the data for each week
+    for i in range(1, len(df)):
+        current_date = df.index[i]  # Get the date from the DataFrame index
+        previous_date = df.index[i - 1]  # Get the previous date
+
+        # Ensure tickers exist in the columns before accessing
+        if ticker1 not in df.columns or ticker2 not in df.columns:
+            print(f"Warning: Missing data for {ticker1} or {ticker2} on {current_date}")
+            continue
+
+        # Access the percent change for each stock
+        change_ticker1 = df.at[current_date, ticker1]  # Change for ticker1
+        change_ticker2 = df.at[current_date, ticker2]  # Change for ticker2
+
+        # Update the prices based on previous week's change (assuming an equal share of initial budget)
+        price_ticker1 = portfolio[ticker1] * (1 + change_ticker1)
+        price_ticker2 = portfolio[ticker2] * (1 + change_ticker2)
+        
+        # Track the new portfolio values
+        portfolio[ticker1] = price_ticker1
+        portfolio[ticker2] = price_ticker2
+        
+        # Calculate the cash value left
+        total_value = portfolio[ticker1] + portfolio[ticker2] + cash
+
+        # Print weekly portfolio value
+        print(f"Date: {current_date}, Portfolio Value: ${total_value}")
+
+        # Check if one stock outperformed the other by more than 5%
+        if abs(change_ticker1 - change_ticker2) > 0.1:
+            if change_ticker1 > change_ticker2:
+                # Ticker1 outperforms, sell 2% of total portfolio and buy 2% more of Ticker2
+                trade_value = total_value * 0.1  # 2% of total portfolio value
+                sell_value = portfolio[ticker1] * 0.1  # 2% of Ticker1 portfolio value
+                
+                # Sell Ticker1, buy Ticker2
+                if sell_value > portfolio[ticker1]:
+                    # Not enough stock to sell, add cash to the bank
+                    cash += sell_value
+                    print(f"Not enough {ticker1} to sell, adding {sell_value} to cash")
+                else:
+                    # Perform the transaction
+                    portfolio[ticker1] -= sell_value
+                    buy_value = trade_value / price_ticker2
+                    portfolio[ticker2] += buy_value
+                    cash -= trade_value
+            else:
+                # Ticker2 outperforms, sell 2% of total portfolio and buy 2% more of Ticker1
+                trade_value = total_value * 0.05  # 2% of total portfolio value
+                sell_value = portfolio[ticker2] * 0.05  # 2% of Ticker2 portfolio value
+                
+                # Sell Ticker2, buy Ticker1
+                if sell_value > portfolio[ticker2]:
+                    # Not enough stock to sell, add cash to the bank
+                    cash += sell_value
+                    print(f"Not enough {ticker2} to sell, adding {sell_value} to cash")
+                else:
+                    # Perform the transaction
+                    portfolio[ticker2] -= sell_value
+                    buy_value = trade_value / price_ticker1
+                    portfolio[ticker1] += buy_value
+                    cash -= trade_value
+
+        # Track the total value at each step for weekly reporting
+        total_value = portfolio[ticker1] + portfolio[ticker2] + cash
+
+    # Report final portfolio value
+    end_value = total_value
+    print(f"End of backtesting: ${end_value}")
+    print(f"Start value: ${start_value}, End value: ${end_value}")
+    return start_value, end_value
+
+
+
+
+
+
+
+
+if __name__ == "__main__":
+    fetch_faang_midday_prices("faang_midday_prices_2023.csv", 2023)
+    fetch_faang_midday_prices("faang_midday_prices_2024.csv", 2024)
+
+    #cleaning 2023 data
+    df = pd.read_csv("faang_midday_prices_2023.csv", dtype=str)
+    third_col_name = df.columns[2]
+    print(third_col_name)
+    
+    for i in range(len(df)):
+        
+        df.at[i, third_col_name] = float((str(df.at[i, third_col_name])).split()[2])
+    df.to_csv("faang_midday_prices_2023.csv", index=False)
+
+    #cleaning 2024 data
+    df = pd.read_csv("faang_midday_prices_2024.csv", dtype=str)
+    third_col_name = df.columns[2]
+    print(third_col_name)
+    
+    for i in range(len(df)):
+        
+        df.at[i, third_col_name] = float((str(df.at[i, third_col_name])).split()[2])
+    df.to_csv("faang_midday_prices_2024.csv", index=False)
+    calculate_weekly_percent_change("faang_midday_prices_2023.csv", "faang_weekly_percent_change2023.csv")
+    calculate_weekly_percent_change("faang_midday_prices_2024.csv", "faang_weekly_percent_change2024.csv")
+
+    compute_normalized_dot_products("faang_weekly_percent_change2023.csv", "faang_ticker_dot_products.csv")
+    start_date = '2024-01-01'
+    end_date = '2024-12-31'
+    input_filename = 'faang_weekly_percent_change2024.csv'
+    dot_products_filename = 'faang_ticker_dot_products.csv'
+
+    start_value, end_value = backtest_top_pairs(input_filename, dot_products_filename, start_date, end_date)
+
+
+
+                
+    
+
